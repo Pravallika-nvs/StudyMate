@@ -1,0 +1,9 @@
+streamlit
+PyMuPDF
+sentence-transformers
+faiss-cpu
+numpy
+deep-translator
+google-generativeai
+torch         # auto-installed with sentence-transformers usually
+transformers  # for embedding models
