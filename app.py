@@ -1,215 +1,231 @@
-import streamlit as st
-import fitz  # PyMuPDF
+import os
+import json
+import re
+import random
 import numpy as np
-from sentence_transformers import SentenceTransformer
+import fitz  # PyMuPDF
 import faiss
-import random, json, tempfile, os
+import streamlit as st
+from sentence_transformers import SentenceTransformer
 from huggingface_hub import InferenceClient
-from huggingface_hub.utils import HfHubHTTPError
-import google.generativeai as genai
 from deep_translator import GoogleTranslator
-from gtts import gTTS
+import google.generativeai as genai
 
-# ------------------------------
-# CONFIG
-# ------------------------------
-st.set_page_config(page_title="StudyMate", page_icon="📘", layout="wide")
-st.title("📘 StudyMate - AI Study Assistant")
+# ==============================
+# 🔹 Secure API Key Handling
+# ==============================
+HF_API_KEY = st.secrets.get("HF_API_KEY", os.environ.get("HF_API_KEY"))
+GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY"))
+
+if not HF_API_KEY or not GEMINI_API_KEY:
+    st.error("❌ Missing API keys! Please set HF_API_KEY and GEMINI_API_KEY in secrets.")
+    st.stop()
 
 # Hugging Face & Gemini setup
-HF_MODEL = "mistralai/Mixtral-8x7B-Instruct-v0.1"
-client = InferenceClient(model=HF_MODEL)
-genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+client = InferenceClient(model="mistralai/Mixtral-8x7B-Instruct-v0.1", token=HF_API_KEY)
+genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
-# ------------------------------
-# SESSION STATE
-# ------------------------------
-if "chunks" not in st.session_state:
-    st.session_state.chunks = []
-if "chunk_metadata" not in st.session_state:
-    st.session_state.chunk_metadata = []
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "quiz_questions" not in st.session_state:
-    st.session_state.quiz_questions = []
-if "quiz_answers" not in st.session_state:
-    st.session_state.quiz_answers = {}
-if "quiz_submitted" not in st.session_state:
-    st.session_state.quiz_submitted = False
+# ==============================
+# 🔹 Streamlit Page Setup
+# ==============================
+st.set_page_config(page_title="StudyMate - PDF Q&A", layout="wide")
+st.title("📘 StudyMate - AI-powered PDF Q&A & Quiz Generator")
 
-# ------------------------------
-# FUNCTIONS
-# ------------------------------
-def extract_chunks_with_metadata(pdf_file, chunk_size=1000, overlap=200):
+lang = st.selectbox("Select Output Language", ["en", "hi", "te", "ta", "fr", "de"])
+
+# ==============================
+# 🔹 Session State
+# ==============================
+if "chat_history" not in st.session_state: st.session_state.chat_history = []
+if "chunks" not in st.session_state: st.session_state.chunks = []
+if "chunk_metadata" not in st.session_state: st.session_state.chunk_metadata = []
+if "index" not in st.session_state: st.session_state.index = None
+if "quiz_questions" not in st.session_state: st.session_state.quiz_questions = []
+if "quiz_answers" not in st.session_state: st.session_state.quiz_answers = {}
+if "quiz_submitted" not in st.session_state: st.session_state.quiz_submitted = False
+if "pdf_name" not in st.session_state: st.session_state.pdf_name = "PDF Document"
+if "embed_model" not in st.session_state:
+    st.session_state.embed_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# ==============================
+# 🔹 PDF Processing & Chunking
+# ==============================
+def extract_chunks_with_metadata(file, chunk_size=1000, overlap=200):
     chunks, metadata = [], []
-    doc = fitz.open(stream=pdf_file.read(), filetype="pdf")
+    doc = fitz.open(stream=file.read(), filetype="pdf")
     for page_num, page in enumerate(doc, start=1):
         text = page.get_text("text")
-        for start in range(0, len(text), chunk_size - overlap):
-            chunk = text[start:start+chunk_size].strip()
+        # Simple chunking
+        start = 0
+        while start < len(text):
+            end = min(len(text), start + chunk_size)
+            chunk = text[start:end].strip()
             if chunk:
                 chunks.append(chunk)
-                metadata.append({"pdf": uploaded_file.name, "page": page_num})
+                metadata.append({"page": page_num})
+            start += chunk_size - overlap
     return chunks, metadata
 
-def generate_answer(query, chunks, chunk_metadata, top_k=3):
-    """Smart answer generation with PDF citation & Gemini fallback."""
-    # Case 0: No PDF uploaded
-    if not chunks:
-        try:
-            gemini_response = gemini_model.generate_content(query)
-            return gemini_response.text + "\n\n💡 No PDF uploaded.", False, None
-        except Exception as e:
-            return f"⚠️ Gemini failed: {e}", False, None
-
-    # Embed and search top PDF chunks
-    embed_model = SentenceTransformer('all-MiniLM-L6-v2')
-    embeddings = embed_model.encode(chunks, convert_to_numpy=True)
-    index = faiss.IndexFlatL2(embeddings.shape[1])
-    index.add(embeddings)
-
-    query_emb = embed_model.encode([query], convert_to_numpy=True)
-    distances, indices = index.search(query_emb, top_k)
-
-    relevant_chunks, context = [], ""
-    for rank, idx in enumerate(indices[0]):
-        relevant_chunks.append({
-            "text": chunks[idx],
-            "pdf": chunk_metadata[idx]["pdf"],
-            "page": chunk_metadata[idx]["page"],
-            "distance": distances[0][rank]
+# ==============================
+# 🔹 Answer Generation
+# ==============================
+def retrieve_chunks(query, top_k=3):
+    query_emb = st.session_state.embed_model.encode([query], convert_to_numpy=True)
+    distances, indices = st.session_state.index.search(query_emb, top_k)
+    results = []
+    for i in range(top_k):
+        idx = indices[0][i]
+        results.append({
+            "text": st.session_state.chunks[idx],
+            "page": st.session_state.chunk_metadata[idx]["page"],
+            "distance": distances[0][i]
         })
-        context += f"[{chunk_metadata[idx]['pdf']} - Page {chunk_metadata[idx]['page']}]\n{chunks[idx]}\n\n"
+    return results
 
-    best_distance = distances[0][0]
+def generate_grounded_answer(query):
+    results = retrieve_chunks(query)
+    
+    # If the nearest chunk is too far → use Gemini fallback
+    if results[0]["distance"] > 50:  # adjust threshold based on embeddings
+        return ask_gemini(query), "Gemini Fallback"
 
-    # Case 1: Relevant PDF Context
-    if best_distance < 1.0:
-        try:
-            messages = [
-                {"role": "system", "content": "You are an academic assistant. Use the PDF context and cite the source."},
-                {"role": "user", "content": f"Context:\n{context}\n\nQuestion:\n{query}"}
+    # Prepare context for Mixtral
+    context = "\n\n".join([f"[Page {r['page']}]\n{r['text']}" for r in results])
+    messages = [
+        {"role": "system", "content":
+         "You are an academic assistant. Answer ONLY using the provided PDF context. Cite page numbers like [p.3]."},
+        {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {query}\nAnswer:"}
+    ]
+    response = client.chat_completion(messages=messages, max_tokens=300)
+    return response.choices[0].message["content"], results
+
+def ask_gemini(question):
+    prompt = f"""
+    You are a helpful educational AI assistant for students.
+
+    Instructions:
+    - If the question is math or requires calculations, give a step-by-step solution.
+    - If the question is theoretical, explain it in a simple and student-friendly way.
+    - Provide mnemonics or memory aids whenever possible for better understanding.
+    - End with a short summary if needed.
+
+    Question: {question}
+    """
+    return gemini_model.generate_content(prompt).text
+
+# ==============================
+# 🔹 MCQ Generation
+# ==============================
+def generate_mcqs(num_mcqs=10):
+    selected_chunks = random.sample(st.session_state.chunks, min(10, len(st.session_state.chunks)))
+    combined_text = "\n\n".join(selected_chunks)
+
+    messages = [
+        {"role": "system", "content":
+         """You are an exam MCQ generator. Create multiple-choice questions
+         from the given PDF content. Return JSON in the following format:
+
+            [
+                {
+                    "question": "...",
+                    "options": ["A...", "B...", "C...", "D..."],
+                    "answer": "A",
+                    "concept": "...",
+                    "explanation": "..."
+                }
             ]
-            response = client.chat_completion(messages=messages, max_tokens=300)
-            answer = response.choices[0].message["content"]
-            top_source = relevant_chunks[0]
-            return f"{answer}\n\n📄 Answered using **{top_source['pdf']}**, page {top_source['page']}.", True, relevant_chunks
-        except HfHubHTTPError:
-            st.warning("⚠️ Hugging Face failed, using Gemini fallback...")
-            try:
-                prompt = f"Context:\n{context}\n\nQuestion:\n{query}\nAnswer and cite the PDF pages."
-                gemini_response = gemini_model.generate_content(prompt)
-                top_source = relevant_chunks[0]
-                return f"{gemini_response.text}\n\n📄 (Gemini) Used **{top_source['pdf']}**, page {top_source['page']}.", True, relevant_chunks
-            except Exception as e:
-                return f"⚠️ Gemini failed after HF error: {e}", True, relevant_chunks
 
-    # Case 2: No Relevant PDF Context → Gemini
+         - 4 options per question
+         - 10 questions total
+         """},
+        {"role": "user", "content": f"PDF Content:\n{combined_text}\n\nGenerate {num_mcqs} MCQs."}
+    ]
+    response = client.chat_completion(messages=messages, max_tokens=2000)
+    json_str = response.choices[0].message.content.strip()
+    json_str = json_str[json_str.find("[") : json_str.rfind("]") + 1]
     try:
-        gemini_prompt = (
-            f"You are a helpful academic AI tutor.\n\n"
-            f"Question: {query}\n\n"
-            f"- No relevant PDF content found.\n"
-            f"- Answer normally and clearly."
-        )
-        gemini_response = gemini_model.generate_content(gemini_prompt)
-        return gemini_response.text + "\n\n💡 This question was answered outside the uploaded PDFs.", False, None
-    except Exception as e:
-        return f"⚠️ Gemini failed: {e}", False, None
+        mcqs = json.loads(json_str)
+        return mcqs
+    except json.JSONDecodeError:
+        st.error("Failed to parse MCQ questions. Please try generating again.")
+        return []
 
-def generate_mcqs_from_chunks(chunks, num_mcqs=5):
-    all_sentences = [line.strip() for chunk in chunks for line in chunk.split(". ") if len(line.strip()) > 20]
-    selected = random.sample(all_sentences, min(num_mcqs, len(all_sentences)))
-    mcqs = []
-    for q in selected:
-        mcqs.append({
-            "question": q,
-            "options": random.sample(all_sentences, 4) if len(all_sentences) >= 4 else [q]*4,
-            "answer": q,
-            "concept": "General",
-            "explanation": q
-        })
-    return mcqs
+# ==============================
+# 🔹 Streamlit Interface
+# ==============================
+uploaded_file = st.file_uploader("📤 Upload your PDF", type="pdf")
+if uploaded_file and st.session_state.index is None:
+    with st.spinner("Processing PDF..."):
+        st.session_state.chunks, st.session_state.chunk_metadata = extract_chunks_with_metadata(uploaded_file)
+        embeddings = st.session_state.embed_model.encode(st.session_state.chunks, convert_to_numpy=True)
+        index = faiss.IndexFlatL2(embeddings.shape[1])
+        index.add(embeddings)
+        st.session_state.index = index
+        st.session_state.pdf_name = uploaded_file.name
+        st.success(f"✅ Processed {len(st.session_state.chunks)} chunks from PDF: {st.session_state.pdf_name}")
 
-def speak_text(text, lang="en"):
-    tts = gTTS(text=text, lang=lang)
-    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-    tts.save(tmp_file.name)
-    return tmp_file.name
-
-# ------------------------------
-# FILE UPLOAD
-# ------------------------------
-uploaded_file = st.file_uploader("📄 Upload a PDF", type="pdf")
-if uploaded_file:
-    st.session_state.chunks, st.session_state.chunk_metadata = extract_chunks_with_metadata(uploaded_file)
-    st.success(f"✅ Extracted {len(st.session_state.chunks)} chunks from {uploaded_file.name}")
-
-# ------------------------------
-# CHAT INTERFACE
-# ------------------------------
-prompt_text = st.chat_input("Ask a question (PDF or general)...")
-
-if prompt_text:
-    # Detect language (no API key required)
-    input_lang = GoogleTranslator(source='auto', target='en').detect(prompt_text)
-    translated_q = GoogleTranslator(source='auto', target='en').translate(prompt_text)
-    answer, from_pdf, sources = generate_answer(translated_q, st.session_state.chunks, st.session_state.chunk_metadata)
-    answer_final = GoogleTranslator(source='en', target=input_lang).translate(answer)
-
-    # Show labeled chat
-    st.chat_message("user").markdown(prompt_text)
-    st.session_state.chat_history.append({"role": "user", "content": prompt_text})
-
-    if from_pdf:
-        labeled_answer = f"📄 **PDF Answer:**\n\n{answer_final}"
+prompt = st.chat_input("Ask a question from your PDF or anything...")
+if prompt:
+    if st.session_state.index is None:
+        translated_q = GoogleTranslator(source='auto', target='en').translate(prompt)
+        answer = ask_gemini(translated_q)
+        answer_final = GoogleTranslator(source='en', target=lang).translate(f"As of my knowledge, {answer}")
+        
+        st.chat_message("user").markdown(prompt)
+        st.chat_message("assistant").markdown(answer_final)
+        st.session_state.chat_history.append({"user": prompt, "bot": answer_final})
     else:
-        labeled_answer = f"💡 **Outside PDF Answer:**\n\n{answer_final}"
+        translated_q = GoogleTranslator(source='auto', target='en').translate(prompt)
+        answer, source = generate_grounded_answer(translated_q)
+        
+        if source == "Gemini Fallback":
+            answer_final = GoogleTranslator(source='en', target=lang).translate(f"As of my knowledge, {answer}")
+        else:
+            page_numbers = [r['page'] for r in source]
+            answer_with_source = f"{answer}\n\n[Source: {st.session_state.pdf_name}, Pages: {', '.join(map(str, set(page_numbers)))}]"
+            answer_final = GoogleTranslator(source='en', target=lang).translate(answer_with_source)
 
-    st.chat_message("assistant").markdown(labeled_answer)
-    st.session_state.chat_history.append({"role": "assistant", "content": labeled_answer})
+        st.chat_message("user").markdown(prompt)
+        st.chat_message("assistant").markdown(answer_final)
+        st.session_state.chat_history.append({"user": prompt, "bot": answer_final})
 
-    # Voice output
-    if st.checkbox("🔊 Speak Answer"):
-        st.audio(speak_text(answer_final, lang=input_lang), format="audio/mp3")
-
-# ------------------------------
-# QUIZ SECTION
-# ------------------------------
-if st.session_state.chunks and not st.session_state.quiz_questions:
-    st.session_state.quiz_questions = generate_mcqs_from_chunks(st.session_state.chunks, num_mcqs=5)
+# ==============================
+# 🔹 Quiz Section
+# ==============================
+if st.button("🧠 Generate Quiz") and st.session_state.index:
+    st.session_state.quiz_questions = generate_mcqs()
+    st.session_state.quiz_answers = {}
+    st.session_state.quiz_submitted = False
+    st.rerun()
 
 if st.session_state.quiz_questions:
-    with st.expander("🧠 Test Your Knowledge - Quiz", expanded=False):
+    with st.expander("🧠 Test Your Knowledge", expanded=True):
         for i, item in enumerate(st.session_state.quiz_questions, start=1):
             qkey = f"q{i}"
-            st.markdown(f"**Q{i}:** {item['question']}?")
+            st.markdown(f"**Q{i}:** {item['question']}")
             st.session_state.quiz_answers[qkey] = st.radio(
-                label=f"Select answer for Q{i}",
-                options=item['options'],
-                index=0,
-                key=qkey,
-                label_visibility="collapsed"
+                label="", options=item['options'], index=0, key=qkey
             )
+        
         if st.button("✅ Submit Quiz"):
-            score = sum(1 for i, item in enumerate(st.session_state.quiz_questions, start=1)
-                        if st.session_state.quiz_answers[f"q{i}"] == item['answer'])
-            st.success(f"Your Score: {score}/{len(st.session_state.quiz_questions)}")
+            correct_answers = 0
+            quiz_results = []
+            
+            for i, item in enumerate(st.session_state.quiz_questions, start=1):
+                qkey = f"q{i}"
+                user_answer = st.session_state.quiz_answers[qkey]
+                correct_option = item['options'][ord(item['answer'])-65]
+                
+                if user_answer == correct_option:
+                    correct_answers += 1
+                    quiz_results.append(f"✅ Q{i}: Correct")
+                else:
+                    quiz_results.append(f"❌ Q{i}: Incorrect (Correct: {correct_option})")
+            
+            st.success(f"Your Score: {correct_answers}/{len(st.session_state.quiz_questions)}")
             st.session_state.quiz_submitted = True
-        if st.button("🔁 Retake Quiz"):
-            st.session_state.quiz_questions = []
-            st.session_state.quiz_answers = {}
-            st.session_state.quiz_submitted = False
-
-# ------------------------------
-# DOWNLOAD CHAT
-# ------------------------------
-if st.session_state.chat_history:
-    st.download_button(
-        label="⬇️", 
-        data=json.dumps(st.session_state.chat_history, indent=2),
-        file_name="chat_history.json",
-        mime="application/json",
-        help="Download Chat"
-    )
+            
+            with st.expander("See Detailed Results"):
+                for result in quiz_results:
+                    st.write(result)
