@@ -3,14 +3,12 @@ import fitz  # PyMuPDF
 import numpy as np
 from sentence_transformers import SentenceTransformer
 import faiss
-import random, json, tempfile, os, wave
+import random, json, tempfile, os
 from huggingface_hub import InferenceClient
 from huggingface_hub.utils import HfHubHTTPError
 import google.generativeai as genai
 from deep_translator import GoogleTranslator
 from gtts import gTTS
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
-import av, speech_recognition as sr
 
 # ------------------------------
 # CONFIG
@@ -149,69 +147,9 @@ if uploaded_file:
     st.success(f"✅ Extracted {len(st.session_state.chunks)} chunks from {uploaded_file.name}")
 
 # ------------------------------
-# VOICE INPUT (FIXED)
-# ------------------------------
-st.markdown("### 🎤 Voice Input")
-
-class AudioProcessor(AudioProcessorBase):
-    def __init__(self):
-        self.recognizer = sr.Recognizer()
-        self.audio_buffer = []
-
-    def recv_audio(self, frame: av.AudioFrame) -> av.AudioFrame:
-        # Convert to mono float32 and append
-        mono_data = frame.to_ndarray().mean(axis=1)
-        self.audio_buffer.append(mono_data)
-        return frame
-
-    def get_text(self):
-        if not self.audio_buffer:
-            return None
-
-        # Combine frames and convert to int16 PCM
-        audio_data = np.concatenate(self.audio_buffer).astype(np.float32)
-        audio_int16 = (audio_data * 32767).astype(np.int16)
-        self.audio_buffer = []  # clear buffer
-
-        # Write to WAV
-        wav_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
-        with wave.open(wav_path, "wb") as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(16000)
-            wf.writeframes(audio_int16.tobytes())
-
-        # Recognize speech
-        with sr.AudioFile(wav_path) as source:
-            audio = self.recognizer.record(source)
-        try:
-            return self.recognizer.recognize_google(audio)
-        except sr.UnknownValueError:
-            return None
-
-webrtc_ctx = webrtc_streamer(
-    key="speech", mode=WebRtcMode.SENDONLY,
-    audio_receiver_size=256,
-    media_stream_constraints={"audio": True, "video": False},
-    async_processing=True,
-)
-
-prompt_text = None
-if webrtc_ctx.audio_receiver:
-    audio_processor = AudioProcessor()
-    audio_frames = webrtc_ctx.audio_receiver.get_frames(timeout=1)
-    for frame in audio_frames:
-        audio_processor.recv_audio(frame)
-    spoken_text = audio_processor.get_text()
-    if spoken_text:
-        prompt_text = spoken_text
-        st.success(f"🎤 Recognized: {spoken_text}")
-
-# ------------------------------
 # CHAT INTERFACE
 # ------------------------------
-if not prompt_text:
-    prompt_text = st.chat_input("Ask a question (PDF or general)...")
+prompt_text = st.chat_input("Ask a question (PDF or general)...")
 
 if prompt_text:
     # Detect language (no API key required)
