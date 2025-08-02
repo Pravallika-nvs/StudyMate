@@ -5,5 +5,11 @@ faiss-cpu
 numpy
 deep-translator
 google-generativeai
+huggingface_hub
+speechrecognition
+gTTS
 torch         # auto-installed with sentence-transformers usually
 transformers  # for embedding models
+av
+streamlit-webrtc
+
