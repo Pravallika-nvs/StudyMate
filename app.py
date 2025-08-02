@@ -57,9 +57,13 @@ def extract_chunks_with_metadata(pdf_file, chunk_size=1000, overlap=200):
 
 def generate_answer(query, chunks, chunk_metadata, top_k=3):
     """Smart answer generation with PDF citation & Gemini fallback."""
+    # Case 0: No PDF uploaded
     if not chunks:
-        gemini_response = gemini_model.generate_content(query)
-        return gemini_response.text + "\n\n💡 No PDF uploaded.", False, None
+        try:
+            gemini_response = gemini_model.generate_content(query)
+            return gemini_response.text + "\n\n💡 No PDF uploaded.", False, None
+        except Exception as e:
+            return f"⚠️ Gemini failed: {e}", False, None
 
     # Embed and search top PDF chunks
     embed_model = SentenceTransformer('all-MiniLM-L6-v2')
@@ -80,7 +84,6 @@ def generate_answer(query, chunks, chunk_metadata, top_k=3):
         })
         context += f"[{chunk_metadata[idx]['pdf']} - Page {chunk_metadata[idx]['page']}]\n{chunks[idx]}\n\n"
 
-    # Decide if PDF is relevant
     best_distance = distances[0][0]
 
     # Case 1: Relevant PDF Context
@@ -96,21 +99,26 @@ def generate_answer(query, chunks, chunk_metadata, top_k=3):
             return f"{answer}\n\n📄 Answered using **{top_source['pdf']}**, page {top_source['page']}.", True, relevant_chunks
         except HfHubHTTPError:
             st.warning("⚠️ Hugging Face failed, using Gemini fallback...")
-            prompt = f"Context:\n{context}\n\nQuestion:\n{query}\nAnswer and cite the PDF pages."
-            gemini_response = gemini_model.generate_content(prompt)
-            top_source = relevant_chunks[0]
-            return f"{gemini_response.text}\n\n📄 (Gemini) Used **{top_source['pdf']}**, page {top_source['page']}.", True, relevant_chunks
+            try:
+                prompt = f"Context:\n{context}\n\nQuestion:\n{query}\nAnswer and cite the PDF pages."
+                gemini_response = gemini_model.generate_content(prompt)
+                top_source = relevant_chunks[0]
+                return f"{gemini_response.text}\n\n📄 (Gemini) Used **{top_source['pdf']}**, page {top_source['page']}.", True, relevant_chunks
+            except Exception as e:
+                return f"⚠️ Gemini failed after HF error: {e}", True, relevant_chunks
 
-    # Case 2: No Relevant PDF Context
-    gemini_prompt = f"""
-    You are a helpful academic AI tutor. 
-    Question: {query}
-
-    - No relevant PDF content found.
-    - Answer normally and clearly.
-    """
-    gemini_response = gemini_model.generate_content(gemini_prompt)
-    return gemini_response.text + "\n\n💡 This question was answered outside the uploaded PDFs.", False, None
+    # Case 2: No Relevant PDF Context → Gemini
+    try:
+        gemini_prompt = (
+            f"You are a helpful academic AI tutor.\n\n"
+            f"Question: {query}\n\n"
+            f"- No relevant PDF content found.\n"
+            f"- Answer normally and clearly."
+        )
+        gemini_response = gemini_model.generate_content(gemini_prompt)
+        return gemini_response.text + "\n\n💡 This question was answered outside the uploaded PDFs.", False, None
+    except Exception as e:
+        return f"⚠️ Gemini failed: {e}", False, None
 
 def generate_mcqs_from_chunks(chunks, num_mcqs=5):
     all_sentences = [line.strip() for chunk in chunks for line in chunk.split(". ") if len(line.strip()) > 20]
@@ -194,10 +202,17 @@ if prompt_text:
     answer, from_pdf, sources = generate_answer(translated_q, st.session_state.chunks, st.session_state.chunk_metadata)
     answer_final = GoogleTranslator(source='en', target=input_lang).translate(answer)
 
+    # ✅ Visual labels in chat
     st.chat_message("user").markdown(prompt_text)
-    st.chat_message("assistant").markdown(answer_final)
     st.session_state.chat_history.append({"role": "user", "content": prompt_text})
-    st.session_state.chat_history.append({"role": "assistant", "content": answer_final})
+
+    if from_pdf:
+        labeled_answer = f"📄 **PDF Answer:**\n\n{answer_final}"
+    else:
+        labeled_answer = f"💡 **Outside PDF Answer:**\n\n{answer_final}"
+
+    st.chat_message("assistant").markdown(labeled_answer)
+    st.session_state.chat_history.append({"role": "assistant", "content": labeled_answer})
 
     if st.checkbox("🔊 Speak Answer"):
         st.audio(speak_text(answer_final, lang=input_lang), format="audio/mp3")
