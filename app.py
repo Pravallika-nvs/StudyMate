@@ -3,11 +3,11 @@ import fitz  # PyMuPDF
 import numpy as np
 from sentence_transformers import SentenceTransformer
 import faiss
-import random, json, tempfile, os
+import random, json, tempfile, os, wave
 from huggingface_hub import InferenceClient
 from huggingface_hub.utils import HfHubHTTPError
 import google.generativeai as genai
-from deep_translator import GoogleTranslator, single_detection
+from deep_translator import GoogleTranslator
 from gtts import gTTS
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, AudioProcessorBase
 import av, speech_recognition as sr
@@ -149,35 +149,45 @@ if uploaded_file:
     st.success(f"✅ Extracted {len(st.session_state.chunks)} chunks from {uploaded_file.name}")
 
 # ------------------------------
-# CHAT INTERFACE
+# VOICE INPUT (FIXED)
 # ------------------------------
-prompt_text = st.chat_input("Ask a question (PDF or general)...")
-
-# Voice input (WebRTC)
 st.markdown("### 🎤 Voice Input")
+
 class AudioProcessor(AudioProcessorBase):
     def __init__(self):
         self.recognizer = sr.Recognizer()
-        self.audio_data = bytearray()
-        self.recognized_text = None
+        self.audio_buffer = []
+
     def recv_audio(self, frame: av.AudioFrame) -> av.AudioFrame:
-        self.audio_data.extend(frame.to_ndarray().tobytes())
+        # Convert to mono float32 and append
+        mono_data = frame.to_ndarray().mean(axis=1)
+        self.audio_buffer.append(mono_data)
         return frame
+
     def get_text(self):
-        if len(self.audio_data) > 0:
-            with sr.AudioFile(self._to_wav()) as source:
-                audio = self.recognizer.record(source)
-            try:
-                self.recognized_text = self.recognizer.recognize_google(audio)
-            except:
-                self.recognized_text = None
-            self.audio_data = bytearray()
-        return self.recognized_text
-    def _to_wav(self):
-        temp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-        with open(temp_wav.name, "wb") as f:
-            f.write(self.audio_data)
-        return temp_wav.name
+        if not self.audio_buffer:
+            return None
+
+        # Combine frames and convert to int16 PCM
+        audio_data = np.concatenate(self.audio_buffer).astype(np.float32)
+        audio_int16 = (audio_data * 32767).astype(np.int16)
+        self.audio_buffer = []  # clear buffer
+
+        # Write to WAV
+        wav_path = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
+        with wave.open(wav_path, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(audio_int16.tobytes())
+
+        # Recognize speech
+        with sr.AudioFile(wav_path) as source:
+            audio = self.recognizer.record(source)
+        try:
+            return self.recognizer.recognize_google(audio)
+        except sr.UnknownValueError:
+            return None
 
 webrtc_ctx = webrtc_streamer(
     key="speech", mode=WebRtcMode.SENDONLY,
@@ -185,6 +195,8 @@ webrtc_ctx = webrtc_streamer(
     media_stream_constraints={"audio": True, "video": False},
     async_processing=True,
 )
+
+prompt_text = None
 if webrtc_ctx.audio_receiver:
     audio_processor = AudioProcessor()
     audio_frames = webrtc_ctx.audio_receiver.get_frames(timeout=1)
@@ -195,14 +207,20 @@ if webrtc_ctx.audio_receiver:
         prompt_text = spoken_text
         st.success(f"🎤 Recognized: {spoken_text}")
 
-# Handle chat
+# ------------------------------
+# CHAT INTERFACE
+# ------------------------------
+if not prompt_text:
+    prompt_text = st.chat_input("Ask a question (PDF or general)...")
+
 if prompt_text:
-    input_lang = single_detection(prompt_text, api_key=None)
+    # Detect language (no API key required)
+    input_lang = GoogleTranslator(source='auto', target='en').detect(prompt_text)
     translated_q = GoogleTranslator(source='auto', target='en').translate(prompt_text)
     answer, from_pdf, sources = generate_answer(translated_q, st.session_state.chunks, st.session_state.chunk_metadata)
     answer_final = GoogleTranslator(source='en', target=input_lang).translate(answer)
 
-    # ✅ Visual labels in chat
+    # Show labeled chat
     st.chat_message("user").markdown(prompt_text)
     st.session_state.chat_history.append({"role": "user", "content": prompt_text})
 
@@ -214,6 +232,7 @@ if prompt_text:
     st.chat_message("assistant").markdown(labeled_answer)
     st.session_state.chat_history.append({"role": "assistant", "content": labeled_answer})
 
+    # Voice output
     if st.checkbox("🔊 Speak Answer"):
         st.audio(speak_text(answer_final, lang=input_lang), format="audio/mp3")
 

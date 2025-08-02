@@ -1,15 +1,16 @@
-streamlit
-PyMuPDF
-sentence-transformers
-faiss-cpu
-numpy
-deep-translator
-google-generativeai
-huggingface_hub
-speechrecognition
-gTTS
-torch         # auto-installed with sentence-transformers usually
-transformers  # for embedding models
-av
-streamlit-webrtc
-
+streamlit==1.47.1
+PyMuPDF==1.26.3
+numpy==2.3.2
+faiss-cpu==1.11.0.post1
+sentence-transformers==5.0.0
+huggingface-hub==0.34.3
+google-generativeai==0.8.5
+deep-translator==1.11.4
+gTTS==2.5.1
+streamlit-webrtc==0.47.7
+av==12.3.0
+SpeechRecognition==3.11.0
+protobuf==5.29.5
+transformers==4.54.1
+scikit-learn==1.7.1
+scipy==1.16.1
